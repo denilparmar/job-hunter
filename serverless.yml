@@ -29,4 +29,4 @@ functions:
   rateHandler:
     handler: src/handler.run
     events:
-      - schedule: rate(1 minute)
+      - schedule: rate(8 hours)
