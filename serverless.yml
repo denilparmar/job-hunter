@@ -1,8 +1,5 @@
-# "org" ensures this Service is used with the correct Serverless Framework Access Key.
 org: denilparmar
-# "app" enables Serverless Framework Dashboard features and sharing them with other Services.
 app: job-hunter
-# "service" is the name of this project. This will also be added to your AWS resource names.
 service: job-hunter
 
 build:
@@ -20,13 +17,48 @@ custom:
     platform: node
     exclude:
       - "@aws-sdk/*"
+  dataBucketName: job-hunter-data-${aws:accountId}-${aws:region}
 
 provider:
   name: aws
   runtime: nodejs20.x
+  timeout: 300
+  memorySize: 1024
+
+  environment:
+    DATA_BUCKET: ${self:custom.dataBucketName}
+    SSM_PREFIX: /job-hunter
+
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - ssm:GetParameter
+            - ssm:GetParameters
+          Resource: arn:aws:ssm:${aws:region}:${aws:accountId}:parameter/job-hunter/*
+        - Effect: Allow
+          Action:
+            - s3:GetObject
+          Resource: arn:aws:s3:::${self:custom.dataBucketName}/*
 
 functions:
   rateHandler:
     handler: src/handler.run
     events:
       - schedule: rate(8 hours)
+
+resources:
+  Resources:
+    DataBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:custom.dataBucketName}
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+  Outputs:
+    DataBucketName:
+      Value: ${self:custom.dataBucketName}
