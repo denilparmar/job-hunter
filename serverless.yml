@@ -1,0 +1,32 @@
+# "org" ensures this Service is used with the correct Serverless Framework Access Key.
+org: denilparmar
+# "app" enables Serverless Framework Dashboard features and sharing them with other Services.
+app: job-hunter
+# "service" is the name of this project. This will also be added to your AWS resource names.
+service: job-hunter
+
+build:
+  esbuild: false
+
+plugins:
+  - serverless-esbuild
+
+custom:
+  esbuild:
+    bundle: true
+    minify: true
+    sourcemap: true
+    target: node20
+    platform: node
+    exclude:
+      - "@aws-sdk/*"
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+
+functions:
+  rateHandler:
+    handler: src/handler.run
+    events:
+      - schedule: rate(1 minute)
