@@ -1,19 +1,14 @@
-import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 import {
   getParam,
   buildJobId,
-  cosineSimilarity,
   NormalizedJob,
   RankedJob,
 } from "./common";
 import { getSeenJobIds, appendJobs } from "./sheets";
 
-const s3 = new S3Client({});
-const BUCKET = process.env.DATA_BUCKET!;
-const RESUME_EMBEDDING_KEY = "resume/embedding.json";
-
-const SCORE_THRESHOLD = 0.78; // tune after seeing real scores come through
+const SCORE_THRESHOLD = 70; // 0-100 scale now — tune after seeing real scores
 const MAX_ALERTS = 10;
+const OPENAI_MODEL = process.env.OPENAI_MODEL ?? "gpt-4o-mini";
 
 // ---------------------------------------------------------------------
 // Step 1: fetch + normalize from Apify
@@ -76,7 +71,6 @@ function normalize(source: string, raw: any): NormalizedJob | null {
         salary = raw.salaryRange;
         break;
       default:
-        // Generic fallback — add a real case above once you know the actor's field names.
         title = raw.title;
         company = raw.company;
         location = raw.location ?? "Remote";
@@ -93,7 +87,7 @@ function normalize(source: string, raw: any): NormalizedJob | null {
       title,
       company,
       location,
-      description: description.slice(0, 6000),
+      description: description.slice(0, 3000), // keep prompt size sane
       url,
       source,
       postedDate,
@@ -119,52 +113,78 @@ async function fetchAllJobs(apifyToken: string): Promise<NormalizedJob[]> {
       }
     } else {
       console.error(`Source ${source} failed:`, result.reason);
-      // One bad source shouldn't kill the whole run.
     }
   });
   return jobs;
 }
 
 // ---------------------------------------------------------------------
-// Step 2: rank against resume embedding
+// Step 2: rank against your skills via an OpenAI chat call
 // ---------------------------------------------------------------------
 
-async function getResumeEmbedding(): Promise<number[]> {
-  const res = await s3.send(
-    new GetObjectCommand({ Bucket: BUCKET, Key: RESUME_EMBEDDING_KEY })
-  );
-  const body = await res.Body!.transformToString();
-  return (JSON.parse(body) as { embedding: number[] }).embedding;
+function buildSystemPrompt(skills: string): string {
+  return [
+    "You are a job-matching assistant.",
+    `The user has the following skills and interests: ${skills}.`,
+    "You will be given a JSON array of job postings, each with a jobId, title, company, location, and description.",
+    "For each job, score how good a fit it is for someone with the user's skills, from 0 to 100 (100 = excellent match).",
+    "Be honest and discriminating — most postings should NOT score above 80 unless the skills overlap is genuinely strong.",
+    'Respond with ONLY valid JSON in this exact shape: {"results": [{"jobId": "...", "score": 0, "reasoning": "one short sentence"}]}',
+    "Include exactly one result object per job you were given, in any order.",
+  ].join(" ");
 }
 
-async function embedTexts(texts: string[], apiKey: string): Promise<number[][]> {
-  const res = await fetch("https://api.openai.com/v1/embeddings", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({ model: "text-embedding-3-small", input: texts }),
-  });
-  if (!res.ok) throw new Error(`OpenAI embeddings failed: ${res.status} ${await res.text()}`);
-  const data = (await res.json()) as { data: { embedding: number[] }[] };
-  return data.data.map((d) => d.embedding);
-}
-
-async function rankJobs(
+async function scoreJobsWithOpenAI(
   jobs: NormalizedJob[],
-  openaiKey: string
+  skills: string,
+  apiKey: string
 ): Promise<RankedJob[]> {
   if (jobs.length === 0) return [];
-  const resumeEmbedding = await getResumeEmbedding();
 
-  const BATCH = 50;
-  const embeddings: number[][] = [];
-  for (let i = 0; i < jobs.length; i += BATCH) {
-    const batch = jobs.slice(i, i + BATCH);
-    const texts = batch.map((j) => `${j.title} at ${j.company}. ${j.description}`);
-    embeddings.push(...(await embedTexts(texts, openaiKey)));
+  const userPayload = jobs.map((j) => ({
+    jobId: j.jobId,
+    title: j.title,
+    company: j.company,
+    location: j.location,
+    description: j.description,
+  }));
+
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: buildSystemPrompt(skills) },
+        { role: "user", content: JSON.stringify(userPayload) },
+      ],
+    }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`OpenAI chat completion failed: ${res.status} ${await res.text()}`);
   }
 
+  const data = (await res.json()) as { choices: { message: { content: string } }[] };
+  const parsed = JSON.parse(data.choices[0].message.content) as {
+    results: { jobId: string; score: number; reasoning: string }[];
+  };
+
+  const scoreById = new Map(parsed.results.map((r) => [r.jobId, r]));
+
   return jobs
-    .map((job, i) => ({ ...job, score: cosineSimilarity(resumeEmbedding, embeddings[i]) }))
+    .map((job) => {
+      const result = scoreById.get(job.jobId);
+      return {
+        ...job,
+        score: result?.score ?? 0,
+        reasoning: result?.reasoning ?? "No score returned by model",
+      };
+    })
     .sort((a, b) => b.score - a.score);
 }
 
@@ -178,10 +198,10 @@ function escapeMd(text: string): string {
 
 function formatMessage(jobs: RankedJob[]): string {
   const lines = jobs.map((j, i) => {
-    const pct = Math.round(j.score * 100);
     return [
-      `${i + 1}. *${escapeMd(j.title)}* — ${escapeMd(j.company)} (${pct}% match)`,
+      `${i + 1}. *${escapeMd(j.title)}* — ${escapeMd(j.company)} (${j.score}/100)`,
       `   📍 ${escapeMd(j.location)}${j.salary ? ` · 💰 ${escapeMd(j.salary)}` : ""}`,
+      `   _${escapeMd(j.reasoning)}_`,
       `   ${j.url}`,
     ].join("\n");
   });
@@ -221,6 +241,9 @@ export const run = async (): Promise<{
   new: number;
   alerted: number;
 }> => {
+  const skills = process.env.SKILLS;
+  if (!skills) throw new Error("SKILLS environment variable is not set");
+
   const [apifyToken, openaiKey, sheetClientEmail, sheetPrivateKey, spreadsheetId] =
     await Promise.all([
       getParam("apify-token"),
@@ -243,8 +266,8 @@ export const run = async (): Promise<{
     return { fetched: jobs.length, new: 0, alerted: 0 };
   }
 
-  // 3. Rank
-  const ranked = await rankJobs(newJobs, openaiKey);
+  // 3. Score via OpenAI against your skills list
+  const ranked = await scoreJobsWithOpenAI(newJobs, skills, openaiKey);
 
   // 4. Write ALL new jobs (with scores) to the sheet for your own record
   await appendJobs(sheetClientEmail, sheetPrivateKey, spreadsheetId, ranked);

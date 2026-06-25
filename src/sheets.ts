@@ -14,6 +14,7 @@ const HEADER_ROW = [
   "source",
   "postedDate",
   "url",
+  "reasoning",
   "dateAdded",
 ];
 
@@ -57,7 +58,7 @@ async function ensureHeader(
   client: JWT,
   spreadsheetId: string
 ): Promise<void> {
-  const range = `${SHEET_NAME}!A1:J1`;
+  const range = `${SHEET_NAME}!A1:K1`;
   const res = await authedFetch(
     client,
     `${SHEETS_API}/${spreadsheetId}/values/${range}`
@@ -106,7 +107,7 @@ export async function appendJobs(
   const now = new Date().toISOString();
   const rows = jobs.map((j) => [
     j.jobId,
-    Math.round(j.score * 1000) / 1000,
+    j.score,
     j.title,
     j.company,
     j.location,
@@ -114,6 +115,7 @@ export async function appendJobs(
     j.source,
     j.postedDate ?? "",
     j.url,
+    j.reasoning,
     now,
   ]);
 

@@ -35,7 +35,8 @@ export interface NormalizedJob {
 }
 
 export interface RankedJob extends NormalizedJob {
-  score: number; // 0-1 cosine similarity vs resume
+  score: number; // 0-100, set by the OpenAI fit-scoring call
+  reasoning: string; // one-line explanation from the model
 }
 
 /** Deterministic ID so the same posting dedupes across sources. */
@@ -53,17 +54,4 @@ export function buildJobId(job: {
     hash = (hash * 33) ^ key.charCodeAt(i);
   }
   return (hash >>> 0).toString(36);
-}
-
-export function cosineSimilarity(a: number[], b: number[]): number {
-  let dot = 0;
-  let normA = 0;
-  let normB = 0;
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i];
-    normA += a[i] * a[i];
-    normB += b[i] * b[i];
-  }
-  if (normA === 0 || normB === 0) return 0;
-  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
 }
